@@ -2,7 +2,7 @@
 # We use a specific version of Alpine for reproducibility.
 # This stage will contain the build tools needed to compile the C++ application.
 # The official Alpine image is multi-architecture and will work for ARM.
-FROM alpine:3.22 AS builder
+FROM ubuntu:latest AS builder
 
 # Set a working directory for the application.
 WORKDIR /app
@@ -25,20 +25,23 @@ COPY server.cpp .
 # Compile the application.
 # We link against pthread and the OpenSSL libraries (ssl, crypto).
 # The output is a dynamically linked executable named 'server'.
-RUN g++ -o server server.cpp -pthread -lssl -lcrypto
+RUN g++ -o server server.cpp -O3 -pthread -lssl -lcrypto
 
 
 # --- Stage 2: Final Image ---
 # This is the final, hardened image that will run the application.
 # It starts from a clean Alpine base to ensure it's minimal.
-FROM alpine:3.22
+FROM ubuntu:latest
 
 # Install only the required RUNTIME dependencies.
 # For our dynamically linked binary, we need the C++ standard library and OpenSSL runtime libraries.
-RUN apk update && apk add --no-cache \
-    libstdc++ \
-    openssl
+RUN apk update && apk add --no-cache libstdc++ openssl build-base wget tar xz
 
+RUN cd /opt && \
+       # https://developer.arm.com/-/media/Files/downloads/gnu/14.3.rel1/binrel/arm-gnu-toolchain-14.3.rel1-mingw-w64-x86_64-aarch64-none-linux-gnu.zip
+    wget https://developer.arm.com/-/media/Files/downloads/gnu-a/14.3-2021.07/binrel/gcc-arm-10.3-2021.07-x86_64-arm-none-linux-gnueabihf.tar.xz && \
+    tar xf gcc-arm-10.3-2021.07-x86_64-arm-none-linux-gnueabihf.tar.xz
+ENV PATH="/opt/gcc-arm-10.3-2021.07-x86_64-arm-none-linux-gnueabihf/bin:${PATH}"
 # Create a dedicated, non-root user and group to run the application.
 # This is a critical security measure to limit the container's privileges.
 # -S creates a system user (no password, no home directory).
