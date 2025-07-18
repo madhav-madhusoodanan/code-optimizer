@@ -5,33 +5,46 @@
 #include <stdexcept>
 #include <array>
 #include <vector>
-#include <chrono> // Required for time measurement
-#include <thread> // Required for sleep
+#include <chrono>
+#include <thread>
+#include <fstream>
+#include <filesystem>
+#include <random>
+#include <sstream>
+#include <regex>
 
-// Required for fork, pipe, dup2, exec, read, close
+// System headers
 #include <unistd.h>
-// Required for waitpid, kill
 #include <sys/wait.h>
-#include <signal.h> // Required for SIGKILL
-// Required for fcntl to set non-blocking I/O
+#include <signal.h>
 #include <fcntl.h>
 
-
-// httplib.h is a single-header library.
-// You can get it from: https://github.com/yhirose/cpp-httplib
-// Just download the httplib.h file and place it in the same directory.
+// httplib
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.h"
 
-// --- Struct to hold the results of command execution ---
+namespace fs = std::filesystem;
+
+// Configuration
+const std::string AS_PATH = "aarch64-none-linux-gnu-as";
+const std::string LD_PATH = "aarch64-none-linux-gnu-ld";
+const int DEFAULT_CPU_CORE = 0; // CPU core to pin execution to
+
 struct CommandResult {
     std::string stdout_output;
     std::string stderr_output;
     int exit_code;
 };
 
-// --- Function to escape special characters for JSON ---
-// This ensures that the output from the command doesn't break the JSON format.
+// Generate unique temporary filename
+std::string generateTempFilename(const std::string& prefix, const std::string& suffix) {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(100000, 999999);
+    return "/tmp/" + prefix + std::to_string(dis(gen)) + suffix;
+}
+
+// Escape JSON string
 std::string escapeJsonString(const std::string& input) {
     std::string output;
     output.reserve(input.length());
@@ -45,12 +58,8 @@ std::string escapeJsonString(const std::string& input) {
             case '\r': output += "\\r";  break;
             case '\t': output += "\\t";  break;
             default:
-                // Note: You might want to escape other control characters depending on your needs.
                 if (c >= 0 && c < 32) {
-                    // Example:
-                    // char buffer[8];
-                    // snprintf(buffer, sizeof(buffer), "\\u%04x", c);
-                    // output += buffer;
+                    // Skip control characters
                 } else {
                     output += c;
                 }
@@ -60,94 +69,87 @@ std::string escapeJsonString(const std::string& input) {
     return output;
 }
 
-
-// --- Function to Execute a Command and Get Separate stdout/stderr with a Timeout ---
-// This function uses fork() and pipe() to create a child process,
-// captures its output, and enforces a timeout.
-CommandResult executeCommand(const char* cmd, int timeout_seconds = 5) {
+// Execute command with timeout and optional CPU pinning
+CommandResult executeCommand(const std::string& cmd, int timeout_seconds = 5, int cpu_core = -1) {
     int stdout_pipe[2];
     int stderr_pipe[2];
     pid_t pid;
 
     if (pipe(stdout_pipe) == -1 || pipe(stderr_pipe) == -1) {
         perror("pipe");
-        return {"", "pipe() failed in server process", -1};
+        return {"", "pipe() failed", -1};
     }
 
     pid = fork();
     if (pid == -1) {
         perror("fork");
-        return {"", "fork() failed in server process", -1};
+        return {"", "fork() failed", -1};
     }
 
-    if (pid == 0) { // --- Child Process ---
-        // Redirect stdout to the write end of the stdout pipe
-        close(stdout_pipe[0]); // Close unused read end
+    if (pid == 0) { // Child Process
+        close(stdout_pipe[0]);
         dup2(stdout_pipe[1], STDOUT_FILENO);
         close(stdout_pipe[1]);
 
-        // Redirect stderr to the write end of the stderr pipe
-        close(stderr_pipe[0]); // Close unused read end
+        close(stderr_pipe[0]);
         dup2(stderr_pipe[1], STDERR_FILENO);
         close(stderr_pipe[1]);
 
-        // Execute the command using a shell
-        execl("/bin/sh", "sh", "-c", cmd, (char*) NULL);
+        // Build command with CPU pinning if requested
+        std::string final_cmd = cmd;
+        if (cpu_core >= 0) {
+            final_cmd = "taskset -c " + std::to_string(cpu_core) + " " + cmd;
+        }
 
-        // If execl returns, it must have failed.
+        execl("/bin/sh", "sh", "-c", final_cmd.c_str(), (char*) NULL);
         perror("execl");
-        _exit(127); // Exit child with an error code
-    } else { // --- Parent Process ---
-        close(stdout_pipe[1]); // Close unused write end
-        close(stderr_pipe[1]); // Close unused write end
+        _exit(127);
+    } else { // Parent Process
+        close(stdout_pipe[1]);
+        close(stderr_pipe[1]);
 
         CommandResult result;
         bool timeout_exceeded = false;
         auto start_time = std::chrono::steady_clock::now();
 
-        // Loop to wait for the child process to finish or for the timeout to expire
         while (true) {
             int status;
-            // WNOHANG makes waitpid return immediately if the child hasn't exited.
             pid_t wait_result = waitpid(pid, &status, WNOHANG);
 
-            if (wait_result == pid) { // Child has terminated
+            if (wait_result == pid) {
                 if (WIFEXITED(status)) {
                     result.exit_code = WEXITSTATUS(status);
                 } else {
-                    result.exit_code = -1; // Indicate failure or abnormal termination
+                    result.exit_code = -1;
                 }
-                break; // Exit the loop
+                break;
             }
 
-            if (wait_result == 0) { // Child is still running
+            if (wait_result == 0) {
                 auto current_time = std::chrono::steady_clock::now();
                 auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(current_time - start_time).count();
 
                 if (elapsed_seconds >= timeout_seconds) {
-                    // Timeout exceeded, kill the child process
                     kill(pid, SIGKILL);
-                    waitpid(pid, &status, 0); // Clean up the zombie process
+                    waitpid(pid, &status, 0);
                     timeout_exceeded = true;
-                    break; // Exit the loop
+                    break;
                 }
 
-                // Sleep briefly to avoid busy-waiting and consuming 100% CPU
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-            } else { // waitpid failed
+            } else {
                 perror("waitpid");
                 result.exit_code = -1;
-                result.stderr_output = "waitpid() failed in parent process";
+                result.stderr_output = "waitpid() failed";
                 break;
             }
         }
 
-        // After the loop, drain any remaining output from the pipes.
-        // Set pipes to non-blocking to avoid getting stuck here.
+        // Set pipes to non-blocking
         fcntl(stdout_pipe[0], F_SETFL, O_NONBLOCK);
         fcntl(stderr_pipe[0], F_SETFL, O_NONBLOCK);
 
+        // Read output
         std::array<char, 256> buffer;
         ssize_t count;
         while ((count = read(stdout_pipe[0], buffer.data(), buffer.size())) > 0) {
@@ -162,46 +164,150 @@ CommandResult executeCommand(const char* cmd, int timeout_seconds = 5) {
 
         if (timeout_exceeded) {
             result.stderr_output += "\nError: Command execution timed out after " + std::to_string(timeout_seconds) + " seconds.";
-            result.exit_code = 124; // Standard exit code for timeout
+            result.exit_code = 124;
         }
 
         return result;
     }
 }
 
-// --- Main Server Function ---
+// Extract CPU cycles from output
+long long extractCpuCycles(const std::string& output) {
+    // Look for pattern "CPU Cycles: <number>"
+    std::regex cycle_pattern(R"(CPU Cycles:\s*(\d+))");
+    std::smatch match;
+    
+    if (std::regex_search(output, match, cycle_pattern)) {
+        return std::stoll(match[1].str());
+    }
+    
+    return -1; // Not found
+}
+
+// Clean up temporary files
+void cleanupFiles(const std::vector<std::string>& files) {
+    for (const auto& file : files) {
+        try {
+            fs::remove(file);
+        } catch (...) {
+            // Ignore errors during cleanup
+        }
+    }
+}
+
+// Process ARM assembly code
+struct ProcessResult {
+    std::string stdout_output;
+    std::string stderr_output;
+    int exit_code;
+    long long cpu_cycles;
+};
+
+ProcessResult processArmAssembly(const std::string& asm_code, int timeout_seconds = 10) {
+    ProcessResult result;
+    result.cpu_cycles = -1;
+    
+    // Generate temporary filenames
+    std::string asm_file = generateTempFilename("arm_asm_", ".s");
+    std::string obj_file = generateTempFilename("arm_obj_", ".o");
+    std::string exe_file = generateTempFilename("arm_exe_", "");
+    
+    std::vector<std::string> temp_files = {asm_file, obj_file, exe_file};
+    
+    try {
+        // Write assembly code to file
+        std::ofstream out(asm_file);
+        if (!out) {
+            result.stderr_output = "Failed to create assembly file";
+            result.exit_code = -1;
+            return result;
+        }
+        out << asm_code;
+        out.close();
+        
+        // Assemble
+        std::string as_cmd = AS_PATH + " -o " + obj_file + " " + asm_file;
+        CommandResult as_result = executeCommand(as_cmd, timeout_seconds / 3);
+        
+        if (as_result.exit_code != 0) {
+            result.stdout_output = as_result.stdout_output;
+            result.stderr_output = "Assembly failed:\n" + as_result.stderr_output;
+            result.exit_code = as_result.exit_code;
+            cleanupFiles(temp_files);
+            return result;
+        }
+        
+        // Link
+        std::string ld_cmd = LD_PATH + " -o " + exe_file + " " + obj_file;
+        CommandResult ld_result = executeCommand(ld_cmd, timeout_seconds / 3);
+        
+        if (ld_result.exit_code != 0) {
+            result.stdout_output = ld_result.stdout_output;
+            result.stderr_output = "Linking failed:\n" + ld_result.stderr_output;
+            result.exit_code = ld_result.exit_code;
+            cleanupFiles(temp_files);
+            return result;
+        }
+        
+        // Execute with CPU pinning
+        CommandResult exec_result = executeCommand(exe_file, timeout_seconds / 2, DEFAULT_CPU_CORE);
+        
+        result.stdout_output = exec_result.stdout_output;
+        result.stderr_output = exec_result.stderr_output;
+        result.exit_code = exec_result.exit_code;
+        
+        // Extract CPU cycles from output
+        result.cpu_cycles = extractCpuCycles(exec_result.stdout_output);
+        
+    } catch (const std::exception& e) {
+        result.stderr_output = "Exception: " + std::string(e.what());
+        result.exit_code = -1;
+    }
+    
+    // Cleanup
+    cleanupFiles(temp_files);
+    
+    return result;
+}
+
 int main() {
-    // Create an instance of the httplib::Server
     httplib::Server svr;
 
-    // --- Define the handler for POST requests to the root "/" ---
+    // Main endpoint for ARM assembly execution
     svr.Post("/", [](const httplib::Request& req, httplib::Response& res) {
-        std::string command_to_execute = req.body;
+        std::string asm_code = req.body;
 
-        if (!command_to_execute.empty()) {
-            std::cout << "Executing command: " << command_to_execute << std::endl;
+        if (!asm_code.empty()) {
+            std::cout << "Processing ARM assembly code..." << std::endl;
 
-            // Execute with a 5-second timeout
-            CommandResult result = executeCommand(command_to_execute.c_str(), 5);
+            ProcessResult result = processArmAssembly(asm_code, 10);
 
-            // Manually construct a JSON response string.
-            // For more complex JSON, a dedicated library like nlohmann/json is recommended.
+            // Build JSON response
             std::string json_response = "{";
             json_response += "\"stdout\": \"" + escapeJsonString(result.stdout_output) + "\",";
             json_response += "\"stderr\": \"" + escapeJsonString(result.stderr_output) + "\",";
-            json_response += "\"exit_code\": " + std::to_string(result.exit_code);
+            json_response += "\"exit_code\": " + std::to_string(result.exit_code) + ",";
+            json_response += "\"cpu_cycles\": " + std::to_string(result.cpu_cycles);
             json_response += "}";
 
             res.set_content(json_response, "application/json");
         } else {
-            res.status = 400; // Bad Request
-            res.set_content("{\"error\": \"No command provided in the POST body.\"}", "application/json");
-            std::cout << "Invalid request received: empty body." << std::endl;
+            res.status = 400;
+            res.set_content("{\"error\": \"No assembly code provided in the POST body.\"}", "application/json");
+            std::cout << "Invalid request: empty body." << std::endl;
         }
     });
 
-    // --- Start the server ---
-    std::cout << "Server listening on port 8080..." << std::endl;
+    // Health check endpoint
+    svr.Get("/health", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_content("{\"status\": \"ok\"}", "application/json");
+    });
+
+    std::cout << "ARM Assembly Execution Server listening on port 8080..." << std::endl;
+    std::cout << "Using assembler: " << AS_PATH << std::endl;
+    std::cout << "Using linker: " << LD_PATH << std::endl;
+    std::cout << "CPU pinning to core: " << DEFAULT_CPU_CORE << std::endl;
+    
     if (!svr.listen("0.0.0.0", 8080)) {
         std::cerr << "Failed to start server" << std::endl;
         return 1;
